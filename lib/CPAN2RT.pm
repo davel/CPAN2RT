@@ -18,7 +18,7 @@ use v5.8.3;
 use strict;
 use warnings;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 use Email::Address;
 use List::Compare;
@@ -28,12 +28,42 @@ use List::MoreUtils qw(uniq);
 our $DEBUG = 0;
 sub debug(&);
 
+=head1 METHODS
+
+=head2 new
+
+Simple constructor that creates a hash based object and stores all
+passed arguments inside it. Then L</init> is called.
+
+=head3 options
+
+=over 8
+
+=item home - RT home dir, RTHOME is checked if empty and defaults to
+"/opt/rt3".
+
+=item debug - turn on ddebug output to STDERR.
+
+=item mirror - CPAN mirror to fetch files from.
+
+=back
+
+=cut
+
 sub new {
     my $proto = shift;
     my $self = bless { @_ }, ref($proto) || $proto;
     $self->init();
     return $self;
 }
+
+=head2 init
+
+Called right after constructor, changes @INC, loads RT and initilize it.
+
+See options in description of L</new>.
+
+=cut
 
 sub init {
     my $self = shift;
@@ -56,7 +86,8 @@ sub sync_files {
     debug { "Syncing files from '$mirror'\n" };
 
     my @files = qw(
-        authors/01mailrc.txt.gz
+        indices/find-ls.gz
+        authors/00whois.xml
         modules/06perms.txt.gz
         modules/02packages.details.txt.gz
     );
@@ -103,26 +134,19 @@ sub authors {
 
 sub _authors {
     my $self = shift;
-    my $file = '01mailrc.txt';
+    my $file = '00whois.xml';
     debug { "Parsing $file...\n" };
     my $path = $self->file_path( $file );
-    open my $fh, "<:utf8", $path or die "Couldn't open '$path': $!";
 
-    my %res;
-    while ( my $str = <$fh> ) {
-        chomp $str;
-        my ($cpanid, $real_name, $email) = ($str =~ m{^alias\s+([A-Z0-9]+)\s+"([^<>]*?)\s*<([^>]+)>"$});
-        unless ( $cpanid ) {
-            debug { "couldn't parse '$str'\n" };
-            next;
-        }
-        $res{ $cpanid } = {
-            real_name => $real_name,
-            email_address => $self->parse_email_address($email) || $cpanid .'@cpan.org',
-        };
-    }
+    use XML::SAX::ParserFactory;
+    my $handler = CPAN2RT::UsersSAXParser->new();
+    my $p = XML::SAX::ParserFactory->parser(Handler => $handler);
+
+    open my $fh, "<:raw", $path or die "Couldn't open '$path': $!";
+    my $res = $p->parse_file( $fh );
     close $fh;
-    return \%res;
+
+    return $res;
 }
 
 { my $cache;
@@ -147,7 +171,7 @@ sub _permissions {
 
         my ($module, $cpanid, $permission) = (split /\s*,\s*/, $str);
         unless ( $module && $cpanid ) {
-            debug { "couldn't parse '$str'\n" };
+            debug { "couldn't parse '$str' from '$file'\n" };
             next;
         }
         $res{ $module } ||= [];
@@ -190,6 +214,46 @@ sub _module2file {
     return \%res;
 }
 
+
+{ my $cache;
+sub all_distributions {
+    my $self = shift;
+    $cache = $self->_all_distributions() unless $cache;
+    return $cache;
+} }
+
+sub _all_distributions {
+    my $self = shift;
+    my $file = 'find-ls';
+    debug { "Parsing $file...\n" };
+    my $path = $self->file_path( $file );
+    open my $fh, "<:utf8", $path or die "Couldn't open '$path': $!";
+
+    my %res;
+    while ( my $str = <$fh> ) {
+        next if $str =~ /^\d+\s+0\s+l\s+1/; # skip symbolic links
+        chomp $str;
+
+        my ($mode, $file) = (split /\s+/, $str)[2, -1];
+        next if index($mode, 'x') >= 0; # skip executables (dirs)
+        # we're only interested in files in authors/id/ dir
+        next unless index($file, "authors/id/") == 0;
+        next unless $file =~ /\.(bz2|zip|tgz|tar\.gz)$/i;
+
+        my $info = CPAN::DistnameInfo->new( $file );
+        my $dist = $info->dist;
+        unless ( $dist ) {
+            debug { "Couldn't parse distribution name from '$file'\n" };
+            next;
+        }
+        push @{ $res{ $dist }{'versions'} ||= [] }, $info->version;
+        push @{ $res{ $dist }{'uploaders'} ||= [] }, $info->cpanid;
+    }
+    close $fh;
+
+    return \%res;
+}
+
 sub sync_authors {
     my $self = shift;
     my $force = shift;
@@ -201,7 +265,7 @@ sub sync_authors {
     my @errors;
     my $authors = $self->authors;
     while ( my ($cpanid, $meta) = each %$authors ) {
-        my ($user, @msg) = $self->load_or_create_user( $cpanid, @{ $meta }{qw(real_name email_address)} );
+        my ($user, @msg) = $self->load_or_create_user( $cpanid, @{ $meta }{qw(fullname email)} );
         push @errors, @msg unless $user;
     }
     return (undef, @errors) if @errors;
@@ -217,6 +281,7 @@ sub sync_distributions {
     }
 
     my @files = uniq values %{ $self->module2file };
+    my $all_dists = $self->all_distributions;
 
     my %tmp;
     foreach my $file ( @files ) {
@@ -235,6 +300,7 @@ sub sync_distributions {
         if ( my $v = $info->version ) {
             push @{ $tmp{ $dist } }, $v;
         }
+        push @{ $tmp{ $dist } }, @{ $all_dists->{ $dist }{'versions'} || [] };
     }
 
     my @errors;
@@ -306,20 +372,29 @@ sub current_maintainers {
     return map uc $_->Name, @{ $users->ItemsArrayRef };
 }
 
+sub filter_maintainers {
+    my $self = shift;
+    my $authors = $self->authors;
+    return grep { ($authors->{$_}{'type'}||'') eq 'author' } @_;
+}
+
 sub set_maintainers {
     my $self = shift;
     my $queue   = shift;
-    my @maints  = @_;
+
+    my @maints  = $self->filter_maintainers( @_ );
     my @current = $self->current_maintainers( $queue );
 
     my @errors;
 
     my $set = List::Compare->new( '--unsorted', \@current, \@maints );
     foreach ( $set->get_unique ) {
+        debug { "Going to delete $_ from maintainers of ". $queue->Name };
         my ($status, @msg) = $self->del_maintainer( $queue, $_, 'force' );
         push @errors, @msg unless $status;
     }
     foreach ( $set->get_complement ) {
+        debug { "Going to add $_ as maintainer of ". $queue->Name };
         my ($status, @msg) = $self->add_maintainer( $queue, $_, 'force' );
         push @errors, @msg unless $status;
     }
@@ -347,7 +422,7 @@ sub add_maintainer {
     }
 
     if ( !$force && $queue->IsAdminCc( $user->PrincipalId ) ) {
-        debug {  $user->Name ." is allready maintainer of '". $queue->Name ."'\n"  };
+        debug {  $user->Name ." is already maintainer of '". $queue->Name ."'\n"  };
         return (1);
     }
 
@@ -396,15 +471,15 @@ sub del_maintainer {
             ." from AdminCc list of '". $queue->Name ."': $msg\n";
         return (undef, $msg);
     } else {
-        debug { "Delete ". $user->Name ." from maintainers of '". $queue->Name ."'\n" };
+        debug { "Deleted ". $user->Name ." from maintainers of '". $queue->Name ."'\n" };
     }
     return (1);
 }
 
-
 sub add_versions {
     my $self = shift;
     my ($queue, @versions) = @_;
+    @versions = uniq @versions;
 
     my @errors;
     foreach my $name ( "Broken in", "Fixed in" ) {
@@ -483,7 +558,9 @@ sub load_or_create_user {
             debug { "Merging user @{[$new->Name]} into @{[$byemail->Name]}...\n" };
             $new->MergeInto( $byemail );
         } else {
-            debug { "WARNING: Couldn't merge users. Extension is not installed.\n" };
+            debug {
+                "WARNING: Couldn't merge user @{[$new->Name]} into @{[$byemail->Name]}."
+                ." Extension is not installed.\n" };
         }
         return ($new);
     }
@@ -532,9 +609,9 @@ sub load_or_create_queue {
         unless ( $status ) {
             return (undef, "Couldn't create queue '$dist': $msg\n");
         }
-		debug { "Created queue for dist ". $queue->Name ." #". $queue->id ."\n" };
+		debug { "Created queue #". $queue->id ." for dist ". $queue->Name ."\n" };
     } else {
-		debug { "Found queue for dist ". $queue->Name ." #". $queue->id ."\n" };
+		debug { "Found queue #". $queue->id ." for dist ". $queue->Name ."\n" };
     }
     return $queue;
 }
@@ -654,6 +731,55 @@ sub skip_header {
 sub debug(&) {
     return unless $DEBUG;
     print STDERR map { /\n$/? $_ : $_."\n" } $_[0]->();
+}
+
+1;
+
+package CPAN2RT::UsersSAXParser;
+use base qw(XML::SAX::Base);
+
+sub start_document {
+    my ($self, $doc) = @_;
+    $self->{'res'} = {};
+}
+
+sub start_element {
+    my ($self, $el) = @_;
+    my $name = $el->{LocalName};
+    return if $name ne 'cpanid' && !$self->{inside};
+
+    if ( $name eq 'cpanid' ) {
+        $self->{inside} = 1;
+        $self->{tmp} = [];
+        return;
+    } else {
+        $self->{inside_prop} = 1;
+    }
+
+    push @{ $self->{'tmp'} }, $name, '';
+}
+
+sub characters {
+    my ($self, $el) = @_;
+    $self->{'tmp'}[-1] .= $el->{Data} if $self->{inside_prop};
+}
+
+sub end_element {
+    my ($self, $el) = @_;
+    $self->{inside_prop} = 0;
+
+    my $name = $el->{LocalName};
+
+    if ( $name eq 'cpanid' ) {
+        $self->{inside} = 0;
+        my %rec = map Encode::decode_utf8($_), @{ delete $self->{'tmp'} };
+        $self->{'res'}{ delete $rec{'id'} } = \%rec;
+    }
+}
+
+sub end_document {
+    my ($self) = @_;
+    return $self->{'res'};
 }
 
 1;
